@@ -1,0 +1,246 @@
+---
+# ============================================================================
+# FORK MODIFICATION: Automated Package Release Workflow
+# ============================================================================
+# This workflow automatically uploads build artifacts from the packaging
+# workflow to a continuously updated "Latest Packages" GitHub release.
+#
+# Purpose:
+#   - Runs after packaging workflow completion on master branch (success or failure)
+#   - Downloads only successful package artifacts
+#   - Creates/updates a single "latest" release with available packages
+#   - Gracefully handles partial build failures
+#   - Does not fail if some package builds failed
+#
+# Merge Considerations:
+#   - This is a fork-specific workflow file
+#   - Should not conflict with upstream as it's not present in upstream
+#   - Safe to keep during merges from netdata/netdata
+# ============================================================================
+
+name: Package Release
+
+# Trigger after the "Packages" workflow completes (success or failure)
+on:
+  workflow_run:
+    workflows: ["Packages"]
+    types:
+      - completed
+    branches:
+      - master
+
+jobs:
+  update-release:
+    name: Update Latest Release
+    runs-on: ubuntu-latest
+
+    # Run even if packaging workflow had failures
+    # We'll upload whatever packages were successfully built
+    if: github.event.workflow_run.head_branch == 'master'
+
+    steps:
+      # Checkout repository to get access to any scripts if needed
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      # Download all available artifacts from the completed packaging workflow
+      # Using GitHub CLI which is pre-installed in ubuntu-latest runners
+      # This will only download artifacts that were successfully created
+      - name: Download Available Artifacts from Packaging Workflow
+        id: download-artifacts
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "Downloading artifacts from workflow run: ${{ github.event.workflow_run.id }}"
+          mkdir -p packages
+
+          # Download artifacts (will succeed even if some are missing)
+          if gh run download ${{ github.event.workflow_run.id }} --dir packages/ 2>&1 | tee download.log; then
+            echo "✅ Artifact download completed"
+            echo "success=true" >> $GITHUB_OUTPUT
+          else
+            # Check if any artifacts were downloaded despite errors
+            if [ -n "$(find packages/ -type f 2>/dev/null)" ]; then
+              echo "⚠️ Partial download - some artifacts may be missing"
+              echo "success=partial" >> $GITHUB_OUTPUT
+            else
+              echo "❌ No artifacts downloaded"
+              echo "success=false" >> $GITHUB_OUTPUT
+            fi
+          fi
+
+          echo "Downloaded content:"
+          ls -la packages/ || echo "No packages directory"
+
+      # Organize packages by extracting all .deb and .rpm files
+      # The packaging workflow creates artifacts named like:
+      #   - debian-12-amd64-packages
+      #   - ubuntu-24.04-arm64-packages
+      #   - rockylinux-9-x86_64-packages
+      # Each artifact directory contains the actual .deb or .rpm files
+      - name: Organize Packages for Release
+        id: organize
+        if: steps.download-artifacts.outputs.success != 'false'
+        continue-on-error: true
+        run: |
+          echo "Organizing packages..."
+          mkdir -p release-assets
+
+          # Find and copy all package files to release-assets directory
+          find packages/ -type f \( -name "*.deb" -o -name "*.rpm" -o -name "*.ddeb" \) -exec cp -v {} release-assets/ \; 2>/dev/null || true
+
+          # Check if we have any packages
+          PACKAGE_COUNT=$(find release-assets/ -type f \( -name "*.deb" -o -name "*.rpm" \) 2>/dev/null | wc -l)
+
+          if [ "$PACKAGE_COUNT" -eq 0 ]; then
+            echo "❌ No packages found to upload"
+            echo "has_packages=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "has_packages=true" >> $GITHUB_OUTPUT
+
+          # Display what we're going to upload
+          echo "Packages ready for release:"
+          ls -lh release-assets/
+
+          # Count packages by type
+          DEB_COUNT=$(find release-assets/ -name "*.deb" 2>/dev/null | wc -l)
+          RPM_COUNT=$(find release-assets/ -name "*.rpm" 2>/dev/null | wc -l)
+          echo "package_count=$PACKAGE_COUNT" >> $GITHUB_OUTPUT
+          echo "deb_count=$DEB_COUNT" >> $GITHUB_OUTPUT
+          echo "rpm_count=$RPM_COUNT" >> $GITHUB_OUTPUT
+
+          echo "Total: $DEB_COUNT .deb packages, $RPM_COUNT .rpm packages"
+
+      # Generate SHA256 checksums for package verification
+      - name: Generate Checksums
+        if: steps.organize.outputs.has_packages == 'true'
+        continue-on-error: true
+        working-directory: release-assets
+        run: |
+          echo "Generating SHA256 checksums..."
+          sha256sum * > SHA256SUMS 2>/dev/null || true
+          echo "Checksums generated:"
+          cat SHA256SUMS
+
+      # Determine build status for release notes
+      - name: Determine Build Status
+        id: status
+        if: steps.organize.outputs.has_packages == 'true'
+        run: |
+          if [ "${{ github.event.workflow_run.conclusion }}" = "success" ]; then
+            echo "status_emoji=✅" >> $GITHUB_OUTPUT
+            echo "status_text=All package builds succeeded" >> $GITHUB_OUTPUT
+          elif [ "${{ steps.download-artifacts.outputs.success }}" = "partial" ]; then
+            echo "status_emoji=⚠️" >> $GITHUB_OUTPUT
+            echo "status_text=Partial build - some packages may have failed" >> $GITHUB_OUTPUT
+          else
+            echo "status_emoji=⚠️" >> $GITHUB_OUTPUT
+            echo "status_text=Some package builds failed - only successful builds included" >> $GITHUB_OUTPUT
+          fi
+
+      # Create or update the "latest" release
+      # This removes old artifacts and uploads new ones
+      - name: Create/Update Latest Release
+        if: steps.organize.outputs.has_packages == 'true'
+        uses: ncipollo/release-action@v1
+        with:
+          # Allow updating existing release
+          allowUpdates: true
+
+          # Remove old artifacts before uploading new ones
+          # This keeps the release clean and prevents accumulation
+          removeArtifacts: true
+
+          # Upload all packages and checksums
+          artifacts: 'release-assets/*'
+
+          # Release body with build information
+          body: |
+            ## Latest Automated Package Builds
+
+            This release is automatically updated with the latest package builds from the master branch.
+
+            ### Build Status
+            ${{ steps.status.outputs.status_emoji }} **${{ steps.status.outputs.status_text }}**
+
+            ### Build Information
+            - **Branch**: ${{ github.event.workflow_run.head_branch }}
+            - **Commit**: ${{ github.event.workflow_run.head_sha }}
+            - **Build Date**: ${{ github.event.workflow_run.updated_at }}
+            - **Workflow Run**: [${{ github.event.workflow_run.id }}](${{ github.event.workflow_run.html_url }})
+            - **Packages Included**: ${{ steps.organize.outputs.package_count }} (${{ steps.organize.outputs.deb_count }} .deb, ${{ steps.organize.outputs.rpm_count }} .rpm)
+
+            ### Available Packages
+
+            #### Debian-based Distributions (.deb)
+            - Debian 11, 12
+            - Ubuntu 20.04, 22.04, 24.04, 24.10
+            - Architectures: amd64, arm64, armhf, i386
+
+            #### RPM-based Distributions (.rpm)
+            - AlmaLinux 8, 9
+            - Amazon Linux 2, 2023
+            - CentOS 7, 9
+            - CentOS Stream 8, 9
+            - Fedora 39, 40, 41
+            - OpenSUSE 15.5, 15.6
+            - Oracle Linux 8, 9
+            - Rocky Linux 8, 9
+            - Architectures: x86_64, aarch64
+
+            ### Installation
+
+            1. Download the appropriate package for your distribution and architecture
+            2. Verify the checksum: `sha256sum -c SHA256SUMS --ignore-missing`
+            3. Install:
+               - Debian/Ubuntu: `sudo dpkg -i netdata_*.deb && sudo apt-get install -f`
+               - RHEL/CentOS/Fedora: `sudo rpm -i netdata-*.rpm`
+
+            ### Notes
+            - Packages are unsigned (fork build)
+            - For official signed packages, visit https://github.com/netdata/netdata
+            - Use `--force-confold` with dpkg if you have custom configurations
+            - If some packages are missing, check the [workflow run](${{ github.event.workflow_run.html_url }}) for build errors
+
+          # Mark as latest release
+          makeLatest: true
+
+          # Use "latest" as the tag name
+          tag: latest
+
+          # Release name
+          name: Latest Packages
+
+          # GitHub token for authentication
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+          # Don't fail if release already exists
+          skipIfReleaseExists: false
+
+      # Summary of what was uploaded
+      - name: Release Summary
+        if: steps.organize.outputs.has_packages == 'true'
+        run: |
+          echo "✅ Release 'Latest Packages' has been updated successfully!"
+          echo ""
+          echo "📦 Uploaded packages (${{ steps.organize.outputs.package_count }} total):"
+          echo "   - ${{ steps.organize.outputs.deb_count }} .deb packages"
+          echo "   - ${{ steps.organize.outputs.rpm_count }} .rpm packages"
+          echo ""
+          echo "🔗 View release at: ${{ github.server_url }}/${{ github.repository }}/releases/tag/latest"
+
+      # Handle case where no packages were found
+      - name: No Packages Warning
+        if: steps.organize.outputs.has_packages != 'true'
+        run: |
+          echo "⚠️ No packages were available to upload to release"
+          echo "This might mean:"
+          echo "  - All package builds failed in the packaging workflow"
+          echo "  - No artifacts were generated"
+          echo "  - Check the packaging workflow run for errors: ${{ github.event.workflow_run.html_url }}"
+          exit 0

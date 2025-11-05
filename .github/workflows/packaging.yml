@@ -274,15 +274,17 @@ jobs:
                      -e VERSION=${{ needs.version-check.outputs.version }} -e DISTRO_VERSION=${{ matrix.version }} \
                      --platform=${{ matrix.platform }} -v "$PWD":/netdata ${{ matrix.base_image }} \
                      /netdata/.github/scripts/pkg-test.sh
+      # FORK MODIFICATION: Added repository check to skip GPG signing on forks
       - name: Import GPG Keys
         id: import-keys
-        if: needs.file-check.outputs.run == 'true' && matrix.format == 'deb' && github.event_name != 'pull_request'
+        if: needs.file-check.outputs.run == 'true' && matrix.format == 'deb' && github.event_name != 'pull_request' && github.repository == 'netdata/netdata'
         uses: crazy-max/ghaction-import-gpg@v6
         with:
           gpg_private_key: ${{ secrets.NETDATABOT_PACKAGE_SIGNING_KEY }}
+      # FORK MODIFICATION: Added repository check to skip GPG signing on forks
       - name: Sign DEB Packages
         id: sign-deb
-        if: needs.file-check.outputs.run == 'true' && matrix.format == 'deb' && github.event_name != 'pull_request'
+        if: needs.file-check.outputs.run == 'true' && matrix.format == 'deb' && github.event_name != 'pull_request' && github.repository == 'netdata/netdata'
         shell: bash
         run: .github/scripts/deb-sign.sh artifacts ${{ steps.import-keys.outputs.fingerprint }}
       - name: SSH setup

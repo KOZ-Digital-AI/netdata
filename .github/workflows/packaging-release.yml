@@ -7,6 +7,7 @@
 #
 # Purpose:
 #   - Runs after packaging workflow completion on master branch (success or failure)
+#   - Can also be manually triggered to create releases from any workflow run
 #   - Downloads successful package artifact archives (one per distro-version-arch)
 #   - Creates zip archives for each build job's packages
 #   - Uploads archives to a single "latest" release (not individual packages)
@@ -27,7 +28,9 @@
 
 name: Package Release
 
-# Trigger after the "Packages" workflow completes (success or failure)
+# Triggers:
+#   1. Automatically after "Packages" workflow completes (success, failure, or cancelled)
+#   2. Manually via workflow_dispatch with optional workflow run ID
 on:
   workflow_run:
     workflows: ["Packages"]
@@ -36,21 +39,95 @@ on:
     branches:
       - master
 
+  # Allow manual triggering to create releases from specific workflow runs
+  workflow_dispatch:
+    inputs:
+      workflow_run_id:
+        description: 'Workflow run ID from Packages workflow (leave empty to use latest completed run)'
+        required: false
+        type: string
+
 jobs:
   update-release:
     name: Update Latest Release
     runs-on: ubuntu-latest
 
-    # Run even if packaging workflow had failures
-    # We'll upload whatever packages were successfully built
-    if: github.event.workflow_run.head_branch == 'master'
+    # Run conditions:
+    #   - For workflow_run: only on master branch
+    #   - For workflow_dispatch: always run
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.head_branch == 'master'
 
     steps:
       # Checkout repository to get access to any scripts if needed
       - name: Checkout Repository
         uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.workflow_run.head_sha }}
+
+      # Determine which workflow run ID to use for artifact download
+      # Supports both automatic (workflow_run) and manual (workflow_dispatch) triggers
+      - name: Determine Workflow Run ID
+        id: get-run-id
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            # Manual trigger
+            if [ -n "${{ inputs.workflow_run_id }}" ]; then
+              # User provided specific run ID
+              echo "run_id=${{ inputs.workflow_run_id }}" >> $GITHUB_OUTPUT
+              echo "📋 Using specified workflow run ID: ${{ inputs.workflow_run_id }}"
+            else
+              # Find the latest completed Packages workflow run
+              echo "🔍 Finding latest Packages workflow run..."
+              RUN_ID=$(gh run list --workflow=packaging.yml --branch=master --limit=1 --json databaseId --jq '.[0].databaseId')
+              echo "run_id=$RUN_ID" >> $GITHUB_OUTPUT
+              echo "📋 Using latest workflow run ID: $RUN_ID"
+            fi
+          else
+            # Automatic trigger from workflow_run
+            echo "run_id=${{ github.event.workflow_run.id }}" >> $GITHUB_OUTPUT
+            echo "📋 Using workflow_run ID: ${{ github.event.workflow_run.id }}"
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Get workflow run details for release notes
+      # Fetches information about the workflow run to include in release body
+      - name: Get Workflow Run Details
+        id: workflow-details
+        run: |
+          RUN_ID="${{ steps.get-run-id.outputs.run_id }}"
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            # Fetch workflow run details via API for manual triggers
+            echo "🔍 Fetching workflow run details for run ID: $RUN_ID"
+            gh api "/repos/${{ github.repository }}/actions/runs/$RUN_ID" \
+              --jq '{
+                head_branch: .head_branch,
+                head_sha: .head_sha,
+                updated_at: .updated_at,
+                html_url: .html_url,
+                conclusion: .conclusion
+              }' > run_details.json
+
+            HEAD_BRANCH=$(jq -r '.head_branch' run_details.json)
+            HEAD_SHA=$(jq -r '.head_sha' run_details.json)
+            UPDATED_AT=$(jq -r '.updated_at' run_details.json)
+            HTML_URL=$(jq -r '.html_url' run_details.json)
+            CONCLUSION=$(jq -r '.conclusion' run_details.json)
+
+            echo "head_branch=$HEAD_BRANCH" >> $GITHUB_OUTPUT
+            echo "head_sha=$HEAD_SHA" >> $GITHUB_OUTPUT
+            echo "updated_at=$UPDATED_AT" >> $GITHUB_OUTPUT
+            echo "html_url=$HTML_URL" >> $GITHUB_OUTPUT
+            echo "conclusion=$CONCLUSION" >> $GITHUB_OUTPUT
+          else
+            # Use workflow_run event data for automatic triggers
+            echo "head_branch=${{ github.event.workflow_run.head_branch }}" >> $GITHUB_OUTPUT
+            echo "head_sha=${{ github.event.workflow_run.head_sha }}" >> $GITHUB_OUTPUT
+            echo "updated_at=${{ github.event.workflow_run.updated_at }}" >> $GITHUB_OUTPUT
+            echo "html_url=${{ github.event.workflow_run.html_url }}" >> $GITHUB_OUTPUT
+            echo "conclusion=${{ github.event.workflow_run.conclusion }}" >> $GITHUB_OUTPUT
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       # Download all available artifacts from the completed packaging workflow
       # Using GitHub CLI which is pre-installed in ubuntu-latest runners
@@ -62,12 +139,12 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          echo "Downloading artifact archives from workflow run: ${{ github.event.workflow_run.id }}"
+          echo "Downloading artifact archives from workflow run: ${{ steps.get-run-id.outputs.run_id }}"
           mkdir -p artifact-archives
 
           # Download artifacts as zip files
           # gh run download preserves the GitHub Actions zip format
-          if gh run download ${{ github.event.workflow_run.id }} --dir artifact-archives/ 2>&1 | tee download.log; then
+          if gh run download ${{ steps.get-run-id.outputs.run_id }} --dir artifact-archives/ 2>&1 | tee download.log; then
             echo "✅ Artifact download completed"
             echo "success=true" >> $GITHUB_OUTPUT
           else
@@ -175,7 +252,7 @@ jobs:
         id: status
         if: steps.organize.outputs.has_archives == 'true'
         run: |
-          if [ "${{ github.event.workflow_run.conclusion }}" = "success" ]; then
+          if [ "${{ steps.workflow-details.outputs.conclusion }}" = "success" ]; then
             echo "status_emoji=✅" >> $GITHUB_OUTPUT
             echo "status_text=All package builds succeeded" >> $GITHUB_OUTPUT
           elif [ "${{ steps.download-artifacts.outputs.success }}" = "partial" ]; then
@@ -212,10 +289,10 @@ jobs:
             ${{ steps.status.outputs.status_emoji }} **${{ steps.status.outputs.status_text }}**
 
             ### Build Information
-            - **Branch**: ${{ github.event.workflow_run.head_branch }}
-            - **Commit**: ${{ github.event.workflow_run.head_sha }}
-            - **Build Date**: ${{ github.event.workflow_run.updated_at }}
-            - **Workflow Run**: [${{ github.event.workflow_run.id }}](${{ github.event.workflow_run.html_url }})
+            - **Branch**: ${{ steps.workflow-details.outputs.head_branch }}
+            - **Commit**: ${{ steps.workflow-details.outputs.head_sha }}
+            - **Build Date**: ${{ steps.workflow-details.outputs.updated_at }}
+            - **Workflow Run**: [${{ steps.get-run-id.outputs.run_id }}](${{ steps.workflow-details.outputs.html_url }})
             - **Package Archives**: ${{ steps.organize.outputs.archive_count }} archives (${{ steps.organize.outputs.deb_archive_count }} deb-based, ${{ steps.organize.outputs.rpm_archive_count }} rpm-based)
 
             ### Archive Structure
@@ -300,7 +377,7 @@ jobs:
             ### Notes
             - ⚠️ Packages are **unsigned** (fork build)
             - Each archive contains multiple package files (main package + plugins)
-            - If some archives are missing, check the [workflow run](${{ github.event.workflow_run.html_url }}) for build errors
+            - If some archives are missing, check the [workflow run](${{ steps.workflow-details.outputs.html_url }}) for build errors
 
           # Mark as latest release
           makeLatest: true
@@ -337,5 +414,5 @@ jobs:
           echo "This might mean:"
           echo "  - All package builds failed in the packaging workflow"
           echo "  - No artifacts were generated"
-          echo "  - Check the packaging workflow run for errors: ${{ github.event.workflow_run.html_url }}"
+          echo "  - Check the packaging workflow run for errors: ${{ steps.workflow-details.outputs.html_url }}"
           exit 0
